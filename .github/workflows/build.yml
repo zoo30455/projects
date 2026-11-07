@@ -59,9 +59,9 @@ jobs:
       - name: Build
         shell: pwsh
         working-directory: renodx
-        run: cmake --build build --config Release --target renodx-dlss5 -j 4
+        run: cmake --build build --config Release --target dlss5 -j 4
 
       - uses: actions/upload-artifact@v4
         with:
           name: renodx-dlss5
-          path: renodx/build/Release/renodx-dlss5.addon64
+          path: renodx/build/**/renodx-dlss5.addon64
