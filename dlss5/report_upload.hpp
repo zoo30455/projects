@@ -55,7 +55,7 @@
 #pragma comment(lib, "winhttp.lib")
 // Loaded on the first upload, not into every game at start.
 #pragma comment(lib, "delayimp.lib")
-#pragma comment(linker, "/DELAYLOAD:winhttp.dll")
+// /DELAYLOAD:winhttp.dll is not allowed in .drectve under lld-link; winhttp loads normally.
 
 namespace renodx::addons::dlss5::report {
 
