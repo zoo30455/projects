@@ -165,7 +165,7 @@ constexpr char kOverlayTitle[] = "DLSS 5 Neural Rendering";
 // default into every file, so a stored 1 at schema 6 is inherited, not
 // chosen.
 constexpr uint32_t kConfigVersion = 7;
-constexpr char kAddonVersion[] = "v8.5.0-rc10-lev1";
+constexpr char kAddonVersion[] = "v8.5.0-rc10-lev2";
 // SHA-256 of the reference signed NR runtime build.  Identification only: a
 // mismatch is reported in the log/overlay but never blocks loading, because
 // swapping in a custom runtime build is a supported diagnostics workflow.
@@ -1676,7 +1676,7 @@ inline constexpr float kPassStrength = 1.f;
 inline constexpr bool kFollowInputRes = false;
 inline constexpr float kResolutionScale = 1.f;
 // Stacked passes 2+ working resolution as a share of pass 1's (1 = same).
-inline constexpr float kStackResolutionScale = 0.67f;  // lev1 default
+inline constexpr float kStackResolutionScale = 0.70f;  // lev1 default (field-efficient at 1080p)
 // Output rect source (v8.0.0-rc2): 0 Auto - the create contract's
 // OutWidth/OutHeight decide, an evaluate block that declares a different
 // size loses (the KCD2 shape); 1 Declared - the evaluate block wins, the
@@ -1989,6 +1989,34 @@ inline std::atomic<float> nr_resolution_scale = defaults::kResolutionScale;
 // DLSSNR subrects (textures stay pass-1-sized), and the decode stage samples
 // it back up exactly as it does for NRResolutionScale.
 inline std::atomic<float> stack_resolution_scale = defaults::kStackResolutionScale;
+// The model's padded field (DLSS-NR 310.8 shape rules, as documented by the
+// clean-room OpenDLSS-NR project): six halvings rounded up to 4, plus one more
+// reduction when level 0 is not whole 8-pixel windows; the field is the valid
+// size aligned to 2^reductions (min 320) with one extra width step when both
+// axes are a multiple of four alignments.  The network's cost follows the
+// FIELD area, not the valid one, so a grid that fills its field is free detail.
+inline uint32_t NrFieldAlignment(uint32_t valid) {
+  uint32_t reductions = 0, size = valid;
+  for (int level = 0; level < 6; ++level) {
+    const uint32_t half = (((size + 1) / 2) + 3u) & ~3u;
+    if (half < size) ++reductions;
+    if (level == 0 && (half % 8u) != 0) ++reductions;
+    size = half;
+  }
+  return 1u << reductions;
+}
+inline uint64_t NrFieldArea(uint32_t width, uint32_t height) {
+  const uint32_t aw = NrFieldAlignment(width), ah = NrFieldAlignment(height);
+  uint32_t fw = std::max(320u, (width + aw - 1) / aw * aw);
+  const uint32_t fh = std::max(320u, (height + ah - 1) / ah * ah);
+  if (fw % (4 * aw) == 0 && fh % (4 * ah) == 0) fw += aw;
+  return static_cast<uint64_t>(fw) * fh;
+}
+
+// Pass 1 runs on the chain grid; passes 2+ on NRStackResolutionScale of it,
+// snapped to the most field-efficient grid near the request: aspect within
+// 4 %, pixel count within 92-108 % of the request, field no larger than the
+// request's own (+2 %).  Cached: the search runs once per distinct input.
 inline void PassWorkingResolution(
     uint32_t pass, uint32_t chain_width, uint32_t chain_height,
     uint32_t& pass_width, uint32_t& pass_height) {
@@ -1997,12 +2025,52 @@ inline void PassWorkingResolution(
   if (pass == 0) return;
   const float scale = std::clamp(stack_resolution_scale.load(), 0.33f, 1.f);
   if (scale >= 0.999f) return;
-  pass_width = std::max(16u, static_cast<uint32_t>(
+  static thread_local uint32_t cache_in[3] = {0, 0, 0};
+  static thread_local uint32_t cache_out[2] = {0, 0};
+  uint32_t scale_key = 0;
+  std::memcpy(&scale_key, &scale, sizeof(scale_key));
+  if (cache_in[0] == chain_width && cache_in[1] == chain_height && cache_in[2] == scale_key) {
+    pass_width = cache_out[0];
+    pass_height = cache_out[1];
+    return;
+  }
+  const uint32_t want_w = std::max(64u, static_cast<uint32_t>(
       std::lround(static_cast<double>(chain_width) * scale)));
-  pass_height = std::max(16u, static_cast<uint32_t>(
+  const uint32_t want_h = std::max(64u, static_cast<uint32_t>(
       std::lround(static_cast<double>(chain_height) * scale)));
-  pass_width = std::min(pass_width, chain_width);
-  pass_height = std::min(pass_height, chain_height);
+  const double want_px = static_cast<double>(want_w) * want_h;
+  const double field_cap = static_cast<double>(NrFieldArea(want_w, want_h)) * 1.02;
+  uint32_t best_w = std::min(want_w, chain_width);
+  uint32_t best_h = std::min(want_h, chain_height);
+  double best_eff = static_cast<double>(best_w) * best_h
+      / static_cast<double>(NrFieldArea(best_w, best_h));
+  const uint32_t lo_w = static_cast<uint32_t>(want_w * 0.92);
+  const uint32_t hi_w = std::min(chain_width, static_cast<uint32_t>(want_w * 1.08));
+  for (uint32_t w = lo_w & ~1u; w <= hi_w; w += 2) {
+    const double fx = static_cast<double>(w) / chain_width;
+    const uint32_t h_lo = static_cast<uint32_t>(fx / 1.04 * chain_height) & ~1u;
+    const uint32_t h_hi = std::min(chain_height,
+        static_cast<uint32_t>(fx * 1.04 * chain_height));
+    for (uint32_t h = h_lo; h <= h_hi; h += 2) {
+      const double px = static_cast<double>(w) * h;
+      if (px < want_px * 0.92 || px > want_px * 1.08) continue;
+      const double field = static_cast<double>(NrFieldArea(w, h));
+      if (field > field_cap) continue;
+      const double eff = px / field;
+      if (eff > best_eff + 1e-9) {
+        best_eff = eff;
+        best_w = w;
+        best_h = h;
+      }
+    }
+  }
+  pass_width = std::max(16u, best_w);
+  pass_height = std::max(16u, best_h);
+  cache_in[0] = chain_width;
+  cache_in[1] = chain_height;
+  cache_in[2] = scale_key;
+  cache_out[0] = pass_width;
+  cache_out[1] = pass_height;
 }
 // NROutputRect (ini-only, defaults::kOutputRect above): which contract names
 // the DLSS output rect NR reads and writes.
