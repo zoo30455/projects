@@ -7863,12 +7863,20 @@ inline void SetSourceView(
 // on without them).
 inline uint32_t LookSurfacesWanted(
     ID3D12Device* device, const look::Settings& settings, uint32_t nr_width,
-    uint32_t nr_height, uint32_t full_width, uint32_t full_height) {
+    uint32_t nr_height, uint32_t full_width, uint32_t full_height,
+    uint32_t stack = 1) {
   // Settings are neutral with the look off (LookSettingsSnapshot), so the
   // bands follow from them alone; a Stabilize with the look off is Detail
-  // stability's.
+  // stability's.  A reduced stacked-pass grid (NRStackResolutionScale) wants
+  // the transport surfaces too, so its edit reaches the output edge-aware.
+  uint32_t stack_width = nr_width;
+  uint32_t stack_height = nr_height;
+  if (stack > 1) PassWorkingResolution(1, nr_width, nr_height, stack_width, stack_height);
   const bool transport =
-      look::TransportWanted(settings, nr_width, nr_height, full_width, full_height);
+      look::TransportWanted(settings, nr_width, nr_height, full_width, full_height)
+      || (stack > 1
+          && look::TransportWanted(
+              settings, stack_width, stack_height, full_width, full_height));
   const uint32_t wanted =
       (look_mode.load() || transport || settings.stabilize != 0u ? kLookSurfaceOutput : 0u)
       | (look::BandsWanted(settings) ? kLookSurfaceBands : 0u)
@@ -7999,7 +8007,10 @@ inline LookRoute RunLookStage(
   // What this chain wanted AND the workset holds: a failed allocation leaves
   // nothing, a sticky workset may hold more than is wanted now.
   const uint32_t live = chain.wanted & res.look_surfaces;
-  const bool transport = (live & kLookSurfaceTransport) != 0;
+  // Per pass: a full-grid pass of a chain whose later passes run reduced
+  // keeps its own (non-transport) resolve.
+  const bool transport = (live & kLookSurfaceTransport) != 0
+      && look::TransportWanted(settings, nr_w, nr_h, res.width, res.height);
   const bool shape =
       (live & kLookSurfaceOutput) != 0 && look::Dispatched(settings, transport);
   bool temporal = shape && settings.stabilize != 0;
@@ -9231,7 +9242,8 @@ inline bool ProcessInline(
   };
   if (codec_ok) {
     look_chain.wanted = LookSurfacesWanted(
-        device, look_chain.settings, nr_input_width, nr_input_height, width, height);
+        device, look_chain.settings, nr_input_width, nr_input_height, width, height,
+        requested_stack);
   }
   FinalResources* workset = codec_ok
       ? EnsureWorkset(
@@ -10583,7 +10595,8 @@ inline bool ProcessInlinePreSR(
   };
   if (codec_ok) {
     look_chain.wanted = LookSurfacesWanted(
-        device, look_chain.settings, nr_input_width, nr_input_height, width, height);
+        device, look_chain.settings, nr_input_width, nr_input_height, width, height,
+        requested_stack);
   }
   FinalResources* workset = codec_ok
       ? EnsureWorkset(
@@ -19090,6 +19103,9 @@ inline constexpr Setting kSetFollowInputRes{
 inline constexpr Setting kSetResolutionScale{
     "NRResolutionScale", &nr_resolution_scale, defaults::kResolutionScale,
     SettingEffect::kNone};
+inline constexpr Setting kSetStackResolutionScale{
+    "NRStackResolutionScale", &stack_resolution_scale,
+    defaults::kStackResolutionScale, SettingEffect::kNone};
 
 // Lowering the pass count must free the retired passes' NR feature handles;
 // raising it starts the new passes from clean temporal state.  The per-pass
@@ -19389,7 +19405,8 @@ inline constexpr const Setting* kHookPointSettings[] = {
     &kSetHookPoint,    &kSetPresentGuides,       &kSetPresentEncoding,
     &kSetPresentWhite, &kSetPresentUiCorrection, &kSetPresentFrames, &kSetPresentFgSource};
 inline constexpr const Setting* kPerformanceSettings[] = {
-    &kSetFollowInputRes, &kSetResolutionScale, &kSetLookUpsample};
+    &kSetFollowInputRes, &kSetResolutionScale, &kSetStackResolutionScale,
+    &kSetLookUpsample};
 inline constexpr const Setting* kStackingSettings[] = {
     &kSetStackPasses,     &kSetPassIntensity[0], &kSetPassIntensity[1],
     &kSetPassIntensity[2], &kSetPassTransfer[0], &kSetPassTransfer[1],
@@ -20250,6 +20267,31 @@ inline void DrawSectionStackingResolution(const ui::PanelText& text) {
   }
   if (text.modern) ResolutionResetButton("resolution_scale_reset");
   if (resolution_changed) CommitResolutionMode(ui_res_mode);
+  if (stack_passes.load() > 1) {
+    // Per-pass resolution: passes 2+ on a coarser grid than pass 1.  Each
+    // change re-creates those passes' NR features once the value settles
+    // (their slots compare the created grid against this every frame).
+    static constexpr const char* kStackScaleTip =
+        "Working resolution of passes 2 and later, as a share of pass 1's."
+        "  Pass 1 builds the detail; later passes refine it and cost less on"
+        " a smaller grid.  100% = every pass at pass 1's resolution.";
+    float ui_stack_pct = stack_resolution_scale.load() * 100.f;
+    if (text.modern) {
+      ui::RowLabel("Passes 2+ resolution", kStackScaleTip);
+      ui::Slider("##stack_resolution_scale", &ui_stack_pct, 33.f, 100.f, "%.0f%%",
+                 kStackScaleTip);
+    } else {
+      ImGui::SliderFloat("Passes 2+ resolution", &ui_stack_pct, 33.f, 100.f, "%.0f%%");
+    }
+    // Snap to 5 % steps: every distinct value is a feature re-create.
+    ui_stack_pct = std::round(std::clamp(ui_stack_pct, 33.f, 100.f) / 5.f) * 5.f;
+    ui_stack_pct = std::max(ui_stack_pct, 33.f);
+    const float live_stack = ui_stack_pct / 100.f;
+    if (std::abs(live_stack - stack_resolution_scale.load()) > 0.001f) {
+      stack_resolution_scale = live_stack;
+      kSetStackResolutionScale.Persist();
+    }
+  }
   // Beside the resolution since rc5, independent of Adjust NR's look: it is how
   // a reduced working resolution's edit reaches the output.
   // Indexed by the stored value, look::kUpsample* (Auto took over 0 in v8.0.2).
@@ -22197,6 +22239,7 @@ inline void LoadConfiguration() {
   }
   bool saved_follow_input = defaults::kFollowInputRes;
   float saved_res_scale = defaults::kResolutionScale;
+  float saved_stack_res_scale = defaults::kStackResolutionScale;
   bool saved_gpu_timers = defaults::kGpuTimers;
   bool saved_crash_dump = defaults::kCrashDump;
   bool saved_cost_meter = defaults::kCostMeter;
@@ -22392,6 +22435,8 @@ inline void LoadConfiguration() {
       nullptr, kConfigSection, "NRFollowInputRes", saved_follow_input);
   reshade::get_config_value(
       nullptr, kConfigSection, "NRResolutionScale", saved_res_scale);
+  reshade::get_config_value(
+      nullptr, kConfigSection, "NRStackResolutionScale", saved_stack_res_scale);
   reshade::get_config_value(
       nullptr, kConfigSection, "NRGpuTimers", saved_gpu_timers);
   reshade::get_config_value(nullptr, kConfigSection, "NRCrashDump", saved_crash_dump);
@@ -22754,6 +22799,9 @@ inline void LoadConfiguration() {
   nr_resolution_scale = SanitizeFloatKey(
       saved_res_scale, defaults::kResolutionScale, 0.33f, 1.f,
       "NRResolutionScale");
+  stack_resolution_scale = SanitizeFloatKey(
+      saved_stack_res_scale, defaults::kStackResolutionScale, 0.33f, 1.f,
+      "NRStackResolutionScale");
   gpu_timers_enabled = saved_gpu_timers;
   lastgasp::dumps_on = saved_crash_dump;
   cost_meter_enabled = saved_cost_meter;
