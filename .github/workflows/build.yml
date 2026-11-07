@@ -15,10 +15,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: clshortfuse/renodx
-          ref: bc0ead3
+          ref: bc0ead39917634e95c534f7e8cfb59ab82880747
           path: renodx
           submodules: recursive
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Install Slang
         shell: pwsh
