@@ -165,7 +165,7 @@ constexpr char kOverlayTitle[] = "DLSS 5 Neural Rendering";
 // default into every file, so a stored 1 at schema 6 is inherited, not
 // chosen.
 constexpr uint32_t kConfigVersion = 7;
-constexpr char kAddonVersion[] = "v8.5.0-rc10-lev2";
+constexpr char kAddonVersion[] = "v8.5.0-rc10-lev3";
 // SHA-256 of the reference signed NR runtime build.  Identification only: a
 // mismatch is reported in the log/overlay but never blocks loading, because
 // swapping in a custom runtime build is a supported diagnostics workflow.
@@ -6556,6 +6556,33 @@ inline bool EnsureNrFeature(
   if (slot.handle != nullptr) return true;
   if (command_list == nullptr || slot.failed) return false;
   if (!EnsureDirectRuntime(command_list)) return false;
+  // lev2: VRAM guard.  On an 8 GB card a stacked chain plus a second
+  // workset (F6 re-enable, the Present-path screenshot) runs the GPU past
+  // its budget, and the runtime's feature create then faults on a failed
+  // allocation (nvngx_dlssnr write at 0x20) instead of returning an error.
+  // Refuse the create while the budget lacks room for it: the pass stays
+  // off (earlier passes still serve the frame) and retries on the backoff.
+  {
+    const telemetry::VideoMemory vram = telemetry::QueryVideoMemory(direct_device);
+    const double pixels_mp =
+        static_cast<double>(input_width) * input_height / 1.0e6;
+    const uint64_t need = (384ull << 20)
+        + static_cast<uint64_t>(pixels_mp * static_cast<double>(160ull << 20));
+    if (vram.valid && vram.local_budget != 0
+        && vram.local_usage + need > vram.local_budget) {
+      slot.failed = true;
+      slot.failed_ns = SteadyNowNs();
+      ++slot.fail_count;
+      std::ostringstream message;
+      message << "feature 18 create deferred (VRAM guard): usage "
+              << (vram.local_usage >> 20) << " MiB + ~" << (need >> 20)
+              << " MiB for NR " << input_width << 'x' << input_height
+              << " would pass the budget " << (vram.local_budget >> 20)
+              << " MiB" << (slot_index != 0 ? " (stack pass " + std::to_string(slot_index + 1) + ")" : "");
+      Log(reshade::log::level::warning, message.str());
+      return false;
+    }
+  }
 
   if (slot.parameters == nullptr) {
     const NVSDK_NGX_Result allocate_result =
