@@ -27,11 +27,17 @@ jobs:
         run: |
           gh release download -R shader-slang/slang --pattern "slang-*-windows-x86_64.zip" -O slang.zip
           Expand-Archive slang.zip -DestinationPath slang
-          gh release download main-tot -R KhronosGroup/glslang --pattern "glslang-main-windows-Release.zip" -O glslang.zip
+          $names = gh release view -R KhronosGroup/glslang --json assets -q '.assets[].name'
+          $names
+          $g = $names | Where-Object { $_ -match 'windows' -and $_ -match '\.zip$' -and $_ -notmatch '(?i)debug' } | Select-Object -First 1
+          if (-not $g) { $names = gh release view main-tot -R KhronosGroup/glslang --json assets -q '.assets[].name'; $names; $g = $names | Where-Object { $_ -match 'windows' -and $_ -match '\.zip$' -and $_ -notmatch '(?i)debug' } | Select-Object -First 1; $tag = 'main-tot' } else { $tag = '' }
+          Write-Host "glslang asset: $g"
+          if ($tag) { gh release download $tag -R KhronosGroup/glslang --pattern $g -O glslang.zip } else { gh release download -R KhronosGroup/glslang --pattern $g -O glslang.zip }
           Expand-Archive glslang.zip -DestinationPath glslang
+          Get-ChildItem -Recurse glslang -Filter glslang*.exe | Select-Object -First 3 FullName
           New-Item -ItemType Directory -Force renodx\bin | Out-Null
           Copy-Item -Recurse slang\bin\* renodx\bin\
-          Copy-Item glslang\bin\* renodx\bin\
+          Get-ChildItem -Recurse glslang -Filter *.exe | Copy-Item -Destination renodx\bin\
           & renodx\bin\slangc.exe -version
           & renodx\bin\glslang.exe --version
 
