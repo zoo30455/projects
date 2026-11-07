@@ -56,6 +56,7 @@
 #include <detours.h>
 
 #include "../../utils/vtable.hpp"
+#include "compat_utils.hpp"
 #include "lastgasp.hpp"
 
 namespace renodx::addons::dlss5::detour_guard {

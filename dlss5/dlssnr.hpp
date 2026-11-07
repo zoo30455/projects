@@ -67,6 +67,7 @@
 #include "../../utils/float16.hpp"
 #include "../../utils/path.hpp"
 #include "../../utils/vtable.hpp"
+#include "compat_utils.hpp"
 #include "arg_plausibility.hpp"
 #include "bridge_params.hpp"
 #include "cmd_slots.hpp"

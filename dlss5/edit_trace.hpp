@@ -68,6 +68,7 @@
 #include <include/reshade.hpp>
 
 #include "../../utils/directx.hpp"
+#include "compat_utils.hpp"
 #include "gpu_lease.hpp"
 #include "look_stage.hpp"
 #include "submission_tracker.hpp"
