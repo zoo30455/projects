@@ -165,7 +165,7 @@ constexpr char kOverlayTitle[] = "DLSS 5 Neural Rendering";
 // default into every file, so a stored 1 at schema 6 is inherited, not
 // chosen.
 constexpr uint32_t kConfigVersion = 7;
-constexpr char kAddonVersion[] = "v8.5.0-rc10";
+constexpr char kAddonVersion[] = "v8.5.0-rc10-lev1";
 // SHA-256 of the reference signed NR runtime build.  Identification only: a
 // mismatch is reported in the log/overlay but never blocks loading, because
 // swapping in a custom runtime build is a supported diagnostics workflow.
@@ -1676,7 +1676,7 @@ inline constexpr float kPassStrength = 1.f;
 inline constexpr bool kFollowInputRes = false;
 inline constexpr float kResolutionScale = 1.f;
 // Stacked passes 2+ working resolution as a share of pass 1's (1 = same).
-inline constexpr float kStackResolutionScale = 1.f;
+inline constexpr float kStackResolutionScale = 0.67f;  // lev1 default
 // Output rect source (v8.0.0-rc2): 0 Auto - the create contract's
 // OutWidth/OutHeight decide, an evaluate block that declares a different
 // size loses (the KCD2 shape); 1 Declared - the evaluate block wins, the
@@ -1687,7 +1687,7 @@ inline constexpr uint32_t kScreenshotHotkey = VK_F5;
 // Per-stage GPU timestamp diagnostics around the injected chain
 // (gpu_timers.hpp).  Off by default: the frame path pays nothing until the
 // user (or a profiling session) asks for numbers.
-inline constexpr bool kGpuTimers = false;
+inline constexpr bool kGpuTimers = true;  // lev1: on by default to measure per-pass cost
 // NRCrashDump (v8.5.0-rc9, lastgasp.hpp dumps_on): a minidump beside the
 // crash log when the game crashes.  Off: a dump holds process memory, so the
 // player turns it on for a crash they will send.
