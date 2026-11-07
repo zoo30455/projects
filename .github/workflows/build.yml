@@ -1,0 +1,54 @@
+name: build-dlss5
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: patch
+
+      - name: Checkout RenoDX
+        uses: actions/checkout@v4
+        with:
+          repository: clshortfuse/renodx
+          ref: bc0ead3
+          path: renodx
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install Slang
+        shell: pwsh
+        run: |
+          $v = "2025.18"
+          Invoke-WebRequest "https://github.com/shader-slang/slang/releases/download/v$v/slang-$v-windows-x86_64.zip" -OutFile slang.zip
+          Expand-Archive slang.zip -DestinationPath slang
+          echo "$PWD\slang\bin" | Out-File -Append $env:GITHUB_PATH
+
+      - name: Add DLSS5 addon source
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force renodx\src\addons\dlss5 | Out-Null
+          Copy-Item -Recurse -Force patch\dlss5\* renodx\src\addons\dlss5\
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure
+        shell: pwsh
+        working-directory: renodx
+        run: cmake --preset clang-x64
+
+      - name: Build
+        shell: pwsh
+        working-directory: renodx
+        run: cmake --build build --config Release --target renodx-dlss5 -j 4
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: renodx-dlss5
+          path: renodx/build/Release/renodx-dlss5.addon64
