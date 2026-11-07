@@ -20,13 +20,20 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - name: Install Slang
+      - name: Install Slang and glslang
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          $v = "2025.18"
-          Invoke-WebRequest "https://github.com/shader-slang/slang/releases/download/v$v/slang-$v-windows-x86_64.zip" -OutFile slang.zip
+          gh release download -R shader-slang/slang --pattern "slang-*-windows-x86_64.zip" -O slang.zip
           Expand-Archive slang.zip -DestinationPath slang
-          echo "$PWD\slang\bin" | Out-File -Append $env:GITHUB_PATH
+          gh release download main-tot -R KhronosGroup/glslang --pattern "glslang-main-windows-Release.zip" -O glslang.zip
+          Expand-Archive glslang.zip -DestinationPath glslang
+          New-Item -ItemType Directory -Force renodx\bin | Out-Null
+          Copy-Item -Recurse slang\bin\* renodx\bin\
+          Copy-Item glslang\bin\* renodx\bin\
+          & renodx\bin\slangc.exe -version
+          & renodx\bin\glslang.exe --version
 
       - name: Add DLSS5 addon source
         shell: pwsh

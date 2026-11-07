@@ -270,6 +270,10 @@ struct NrFeatureSlot {
   // global reset epoch (a new slot must never reset older slots or another
   // stream's history).
   bool pending_reset = false;
+  // Working dimensions this handle was created at (per-pass resolution,
+  // NRStackResolutionScale): a mismatch retires and recreates the slot.
+  uint32_t created_width = 0;
+  uint32_t created_height = 0;
   // The queue tracker was live when this handle was created, so every
   // recording that used it is a tracked submission use (see
   // RetiredNrFeature::tracker_proof).
@@ -1670,6 +1674,8 @@ inline constexpr uint32_t kFeedMode = 0;
 inline constexpr float kPassStrength = 1.f;
 inline constexpr bool kFollowInputRes = false;
 inline constexpr float kResolutionScale = 1.f;
+// Stacked passes 2+ working resolution as a share of pass 1's (1 = same).
+inline constexpr float kStackResolutionScale = 1.f;
 // Output rect source (v8.0.0-rc2): 0 Auto - the create contract's
 // OutWidth/OutHeight decide, an evaluate block that declares a different
 // size loses (the KCD2 shape); 1 Declared - the evaluate block wins, the
@@ -1975,6 +1981,28 @@ inline std::atomic_bool chained_temporal_history = defaults::kChainedHistory;
 // avoids the low-res Color contract the signed runtime rejects outright.
 inline std::atomic_bool nr_follow_input_res = defaults::kFollowInputRes;
 inline std::atomic<float> nr_resolution_scale = defaults::kResolutionScale;
+// Per-pass working resolution (stacked passes 2..kMaxNrPasses): a share of
+// pass 1's working resolution.  Passes 2+ refine an image pass 1 already
+// built, so they tolerate a coarser grid; the model's cost scales with the
+// pixel count.  The NR feature runs 1:1 at the smaller grid through the
+// DLSSNR subrects (textures stay pass-1-sized), and the decode stage samples
+// it back up exactly as it does for NRResolutionScale.
+inline std::atomic<float> stack_resolution_scale = defaults::kStackResolutionScale;
+inline void PassWorkingResolution(
+    uint32_t pass, uint32_t chain_width, uint32_t chain_height,
+    uint32_t& pass_width, uint32_t& pass_height) {
+  pass_width = chain_width;
+  pass_height = chain_height;
+  if (pass == 0) return;
+  const float scale = std::clamp(stack_resolution_scale.load(), 0.33f, 1.f);
+  if (scale >= 0.999f) return;
+  pass_width = std::max(16u, static_cast<uint32_t>(
+      std::lround(static_cast<double>(chain_width) * scale)));
+  pass_height = std::max(16u, static_cast<uint32_t>(
+      std::lround(static_cast<double>(chain_height) * scale)));
+  pass_width = std::min(pass_width, chain_width);
+  pass_height = std::min(pass_height, chain_height);
+}
 // NROutputRect (ini-only, defaults::kOutputRect above): which contract names
 // the DLSS output rect NR reads and writes.
 inline std::atomic<uint32_t> nr_output_rect = defaults::kOutputRect;
@@ -6549,6 +6577,8 @@ inline bool EnsureNrFeature(
   slot.configuration_generation = configuration_generation.load();
   slot.nr_hdr_mode = resources.hdr_mode;
   slot.pending_reset = true;
+  slot.created_width = input_width;
+  slot.created_height = input_height;
   // fail_count is NOT cleared here: only a successful evaluate proves the
   // slot works.  A contract that creates but fails its evaluate would
   // otherwise re-create (a 100-250 ms stall) on every frame.
@@ -7959,10 +7989,12 @@ inline LookRoute RunLookStage(
     NrFeatureSlot& slot,
     uint32_t pass,
     const LookChain& chain,
-    const EvaluationContract& frame) {
+    const EvaluationContract& frame,
+    uint32_t nr_w,
+    uint32_t nr_h) {
   const uint32_t codec_set = pass * kCodecSrvSetStride;
   const LookRoute unchanged{
-      codec_set, res.input_width, res.input_height, res.input_width, res.input_height};
+      codec_set, nr_w, nr_h, nr_w, nr_h};
   const look::Settings& settings = chain.settings;
   // What this chain wanted AND the workset holds: a failed allocation leaves
   // nothing, a sticky workset may hold more than is wanted now.
@@ -7973,8 +8005,8 @@ inline LookRoute RunLookStage(
   bool temporal = shape && settings.stabilize != 0;
   LookHistory& history = slot.look_history;
   if (history.buffers[0] != nullptr
-      && (!temporal || history.width != res.input_width
-          || history.height != res.input_height)) {
+      && (!temporal || history.width != nr_w
+          || history.height != nr_h)) {
     // Stabilize went off (or the look did), or the NR resolution changed:
     // the pair retires like a handle, behind this slot's tracked uses.
     retired_nr_features.push_back(NrRetirement(slot));
@@ -7998,8 +8030,8 @@ inline LookRoute RunLookStage(
       .history_out = res.look_trace_histogram->GetGPUVirtualAddress(),
   };
   look::Frame look_frame{
-      .nr_width = res.input_width,
-      .nr_height = res.input_height,
+      .nr_width = nr_w,
+      .nr_height = nr_h,
       .full_width = res.width,
       .full_height = res.height,
       .reference_linear = res.hdr_mode != 0,
@@ -8016,8 +8048,8 @@ inline LookRoute RunLookStage(
          .time_ns = SteadyNowNs(),
          .workset = res.id,
          .pass = pass + 1,
-         .nr_width = res.input_width,
-         .nr_height = res.input_height});
+         .nr_width = nr_w,
+         .nr_height = nr_h});
     look_traced_passes.fetch_add(1, std::memory_order_relaxed);
   }
   if (!shape) {
@@ -8029,13 +8061,13 @@ inline LookRoute RunLookStage(
 
   const int64_t now_ns = SteadyNowNs();
   if (temporal && history.buffers[0] == nullptr) {
-    const uint64_t bytes = static_cast<uint64_t>(res.input_width) * res.input_height
+    const uint64_t bytes = static_cast<uint64_t>(nr_w) * nr_h
         * look::kHistoryBytesPerPixel;
     if (CreateScratchBuffer(device, bytes, &history.buffers[0], L"DLSS5 Generic look history")
         && CreateScratchBuffer(
             device, bytes, &history.buffers[1], L"DLSS5 Generic look history")) {
-      history.width = res.input_width;
-      history.height = res.input_height;
+      history.width = nr_w;
+      history.height = nr_h;
     } else {
       // No history this frame: shape without the temporal filter and try
       // again next frame (a failed allocation is logged by the helper).
@@ -8077,10 +8109,10 @@ inline LookRoute RunLookStage(
         look_frame.motion = grid_width != 0 && grid_height != 0;
         look_frame.motion_scale[0] = chain.motion_scale[0]
             * motion_scale_x_multiplier.load()
-            * static_cast<float>(res.input_width) / static_cast<float>(grid_width);
+            * static_cast<float>(nr_w) / static_cast<float>(grid_width);
         look_frame.motion_scale[1] = chain.motion_scale[1]
             * motion_scale_y_multiplier.load()
-            * static_cast<float>(res.input_height) / static_cast<float>(grid_height);
+            * static_cast<float>(nr_h) / static_cast<float>(grid_height);
         look_frame.motion_base[0] = frame.motion_x;
         look_frame.motion_base[1] = frame.motion_y;
         look_frame.motion_grid[0] = grid_width;
@@ -8114,11 +8146,11 @@ inline LookRoute RunLookStage(
       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   res.look_output_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
   FinishLookPass(&history, temporal, whole_edit, now_ns, constants, res.id, pass,
-                 res.input_width, res.input_height);
+                 nr_w, nr_h);
   if (!transport) {
     gpu_timers::Mark(command_list, gpu_timers::PassLookEnd(pass));
-    return {kDescriptorLookSet + codec_set, res.input_width, res.input_height,
-            res.input_width, res.input_height, true};
+    return {kDescriptorLookSet + codec_set, nr_w, nr_h,
+            nr_w, nr_h, true};
   }
   for (ID3D12Resource* surface : {res.look_up_proxy, res.look_up_neural}) {
     Transition(
@@ -9539,7 +9571,26 @@ inline bool ProcessInline(
   float final_pass_transfer = 0.f;
   float final_pass_color = 0.f;
   bool final_pass_shaped = false;
+  // Per-pass working resolution (NRStackResolutionScale): passes 2+ may
+  // run on a coarser grid than the chain's; the loop body shadows the
+  // chain dimensions with the pass's own.
+  const uint32_t chain_nr_input_width = nr_input_width;
+  const uint32_t chain_nr_input_height = nr_input_height;
   for (uint32_t pass = 0; pass < requested_stack; ++pass) {
+    uint32_t nr_input_width = chain_nr_input_width;
+    uint32_t nr_input_height = chain_nr_input_height;
+    PassWorkingResolution(pass, chain_nr_input_width, chain_nr_input_height,
+                          nr_input_width, nr_input_height);
+    const uint32_t feature_out_width = nr_input_width;
+    const uint32_t feature_out_height = nr_input_height;
+    if (feature.slots[pass].handle != nullptr
+        && feature.slots[pass].created_width != 0
+        && (feature.slots[pass].created_width != nr_input_width
+            || feature.slots[pass].created_height != nr_input_height)) {
+      // The pass grid changed: retire the handle behind its tracked uses;
+      // the slot re-creates below and matures next frame.
+      ReleaseNrSlot(feature, pass, true);
+    }
     // Encode source and decode reference for this pass: the copied DLSS
     // output for the first pass, the previous pass's decoded result after.
     // Each pass re-normalizes the running image into the proxy, so the model
@@ -9824,7 +9875,8 @@ inline bool ProcessInline(
     // The look stage reshapes the model's edit (or measures it) before the
     // resolve, which then reads the route it returns.
     const LookRoute route =
-        RunLookStage(command_list, device, res, feature.slots[pass], pass, look_chain, frame);
+        RunLookStage(command_list, device, res, feature.slots[pass], pass, look_chain, frame,
+                     nr_input_width, nr_input_height);
     Transition(
         command_list, write_surface,
         *write_state,
@@ -10781,7 +10833,24 @@ inline bool ProcessInlinePreSR(
   float final_pass_transfer = 0.f;
   float final_pass_color = 0.f;
   bool final_pass_shaped = false;
+  // Per-pass working resolution (NRStackResolutionScale): passes 2+ may
+  // run on a coarser grid than the chain's; the loop body shadows the
+  // chain dimensions with the pass's own.
+  const uint32_t chain_nr_input_width = nr_input_width;
+  const uint32_t chain_nr_input_height = nr_input_height;
   for (uint32_t pass = 0; pass < requested_stack; ++pass) {
+    uint32_t nr_input_width = chain_nr_input_width;
+    uint32_t nr_input_height = chain_nr_input_height;
+    PassWorkingResolution(pass, chain_nr_input_width, chain_nr_input_height,
+                          nr_input_width, nr_input_height);
+    if (feature.slots[pass].handle != nullptr
+        && feature.slots[pass].created_width != 0
+        && (feature.slots[pass].created_width != nr_input_width
+            || feature.slots[pass].created_height != nr_input_height)) {
+      // The pass grid changed: retire the handle behind its tracked uses;
+      // the slot re-creates below and matures next frame.
+      ReleaseNrSlot(feature, pass, true);
+    }
     // v6 HDR swaps the linear work surfaces in (work0 for pass 0, the
     // previous pass's work output after - the fixed set fill's parity);
     // SDR keeps the game color / decoded ping-pong arrangement.
@@ -11046,7 +11115,8 @@ inline bool ProcessInlinePreSR(
     last_model_pass = static_cast<int32_t>(pass);
     // The look stage, as on the after path.
     const LookRoute route =
-        RunLookStage(command_list, device, res, feature.slots[pass], pass, look_chain, frame);
+        RunLookStage(command_list, device, res, feature.slots[pass], pass, look_chain, frame,
+                     nr_input_width, nr_input_height);
     Transition(
         command_list,
         write_surface,
